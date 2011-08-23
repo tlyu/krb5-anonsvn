@@ -78,10 +78,7 @@ extern int daemon(int, int);
 
 static void usage (char *);
 
-static krb5_sigtype request_exit (int);
-static krb5_sigtype request_hup  (int);
-
-static void setup_signal_handlers (void);
+static void request_hup (verto_ctx *ctx, verto_ev *ev);
 
 static krb5_error_code setup_sam (void);
 
@@ -93,10 +90,7 @@ static int nofork = 0;
 static int workers = 0;
 static const char *pid_file = NULL;
 static int rkey_init_done = 0;
-
-#ifdef POSIX_SIGNALS
-static struct sigaction s_action;
-#endif /* POSIX_SIGNALS */
+static int signal_received = 0;
 
 #define KRB5_KDC_MAX_REALMS     32
 
@@ -485,52 +479,25 @@ whoops:
     return(kret);
 }
 
-static krb5_sigtype
-request_exit(int signo)
-{
-    signal_requests_exit = 1;
-
-#ifdef POSIX_SIGTYPE
-    return;
-#else
-    return(0);
-#endif
-}
-
-static krb5_sigtype
-request_hup(int signo)
-{
-    signal_requests_reset = 1;
-
-#ifdef POSIX_SIGTYPE
-    return;
-#else
-    return(0);
-#endif
-}
-
 static void
-setup_signal_handlers(void)
+request_hup(verto_ctx *ctx, verto_ev *ev)
 {
-#ifdef POSIX_SIGNALS
-    (void) sigemptyset(&s_action.sa_mask);
-    s_action.sa_flags = 0;
-    s_action.sa_handler = request_exit;
-    (void) sigaction(SIGINT, &s_action, (struct sigaction *) NULL);
-    (void) sigaction(SIGTERM, &s_action, (struct sigaction *) NULL);
-    s_action.sa_handler = request_hup;
-    (void) sigaction(SIGHUP, &s_action, (struct sigaction *) NULL);
-    s_action.sa_handler = SIG_IGN;
-    (void) sigaction(SIGPIPE, &s_action, (struct sigaction *) NULL);
-#else  /* POSIX_SIGNALS */
-    signal(SIGINT, request_exit);
-    signal(SIGTERM, request_exit);
-    signal(SIGHUP, request_hup);
-    signal(SIGPIPE, SIG_IGN);
-#endif /* POSIX_SIGNALS */
-
-    return;
+    krb5_klog_reopen(get_context(NULL));
+    reset_for_hangup();
 }
+
+static krb5_sigtype
+on_monitor_signal(int signo)
+{
+    signal_received = signo;
+
+#ifdef POSIX_SIGTYPE
+    return;
+#else
+    return(0);
+#endif
+}
+
 
 /*
  * Kill the worker subprocesses given by pids[0..bound-1], skipping any which
@@ -564,10 +531,13 @@ terminate_workers(pid_t *pids, int bound, int num_active)
  * function in error cases.
  */
 static krb5_error_code
-create_workers(int num)
+create_workers(verto_ctx *ctx, int num)
 {
     int i, status, numleft;
     pid_t pid, *pids;
+#ifdef POSIX_SIGNALS
+    struct sigaction s_action;
+#endif /* POSIX_SIGNALS */
 
     /* Create child worker processes; return in each child. */
     krb5_klog_syslog(LOG_INFO, _("creating %d worker processes"), num);
@@ -591,9 +561,28 @@ create_workers(int num)
         pids[i] = pid;
     }
 
+    /* We're going to use our own main loop here. */
+    loop_free(ctx);
+
+    /* Setup our signal handlers which will forward to the children. */
+#ifdef POSIX_SIGNALS
+    (void) sigemptyset(&s_action.sa_mask);
+    s_action.sa_flags = 0;
+    s_action.sa_handler = on_monitor_signal;
+    (void) sigaction(SIGINT, &s_action, (struct sigaction *) NULL);
+    (void) sigaction(SIGTERM, &s_action, (struct sigaction *) NULL);
+    (void) sigaction(SIGQUIT, &s_action, (struct sigaction *) NULL);
+    (void) sigaction(SIGHUP, &s_action, (struct sigaction *) NULL);
+#else  /* POSIX_SIGNALS */
+    signal(SIGINT, on_monitor_signal);
+    signal(SIGTERM, on_monitor_signal);
+    signal(SIGQUIT, on_monitor_signal);
+    signal(SIGHUP, on_monitor_signal);
+#endif /* POSIX_SIGNALS */
+
     /* Supervise the worker processes. */
     numleft = num;
-    while (!signal_requests_exit) {
+    while (!signal_received) {
         /* Wait until a worker process exits or we get a signal. */
         pid = wait(&status);
         if (pid >= 0) {
@@ -612,17 +601,19 @@ create_workers(int num)
         }
 
         /* Propagate HUP signal to worker processes if we received one. */
-        if (signal_requests_reset) {
-            for (i = 0; i < num; i++) {
-                if (pids[i] != -1)
-                    kill(pids[i], SIGHUP);
+        if (signal_received) {
+            krb5_klog_syslog(LOG_INFO,
+                             _("signal %d received in supervisor"),
+                             signal_received);
+
+            if (signal_received == SIGHUP) {
+                for (i = 0; i < num; i++) {
+                    if (pids[i] != -1)
+                        kill(pids[i], SIGHUP);
+                }
+                signal_received = 0;
             }
-            signal_requests_reset = 0;
         }
-    }
-    if (signal_requests_exit) {
-        krb5_klog_syslog(LOG_INFO,
-                         _("shutdown signal received in supervisor"));
     }
 
     terminate_workers(pids, num, numleft);
@@ -948,6 +939,7 @@ int main(int argc, char **argv)
 {
     krb5_error_code     retval;
     krb5_context        kcontext;
+    verto_ctx *ctx;
     int errout = 0;
     int i;
 
@@ -989,7 +981,18 @@ int main(int argc, char **argv)
      */
     initialize_realms(kcontext, argc, argv);
 
-    setup_signal_handlers();
+    ctx = loop_init(VERTO_EV_TYPE_CHILD | VERTO_EV_TYPE_SIGNAL);
+    if (!ctx) {
+        kdc_err(kcontext, ENOMEM, _("while creating main loop"));
+        finish_realms();
+        return 1;
+    }
+
+    if (!verto_add_signal(ctx, VERTO_EV_FLAG_PERSIST, request_hup, SIGHUP)) {
+        kdc_err(kcontext, ENOMEM, _("while registering signal handler"));
+        finish_realms();
+        return 1;
+    }
 
     load_preauth_plugins(kcontext);
     load_authdata_plugins(kcontext);
@@ -1039,7 +1042,15 @@ int main(int argc, char **argv)
      * children won't be able to re-open the listener sockets.  Hopefully our
      * platform has pktinfo support and doesn't need reconfigs.
      */
-    if ((retval = loop_setup_network(NULL, kdc_progname, (workers > 0)))) {
+    if (workers > 0) {
+        retval = loop_setup_routing_socket(ctx, NULL, kdc_progname);
+        if (retval) {
+            kdc_err(kcontext, retval, _("while initializing routing socket"));
+            finish_realms();
+            return 1;
+        }
+    }
+    if ((retval = loop_setup_network(ctx, NULL, kdc_progname))) {
     net_init_error:
         kdc_err(kcontext, retval, _("while initializing network"));
         finish_realms();
@@ -1060,7 +1071,7 @@ int main(int argc, char **argv)
     }
     if (workers > 0) {
         finish_realms();
-        retval = create_workers(workers);
+        retval = create_workers(ctx, workers);
         if (retval) {
             kdc_err(kcontext, errno, _("creating worker processes"));
             return 1;
@@ -1071,11 +1082,9 @@ int main(int argc, char **argv)
     krb5_klog_syslog(LOG_INFO, _("commencing operation"));
     if (nofork)
         fprintf(stderr, _("%s: starting...\n"), kdc_progname);
-    if ((retval = loop_listen_and_process(0, kdc_progname, reset_for_hangup))) {
-        kdc_err(kcontext, retval, _("while processing network requests"));
-        errout++;
-    }
-    loop_closedown_network();
+
+    verto_run(ctx);
+    loop_free(ctx);
     krb5_klog_syslog(LOG_INFO, _("shutting down"));
     unload_preauth_plugins(kcontext);
     unload_authdata_plugins(kcontext);

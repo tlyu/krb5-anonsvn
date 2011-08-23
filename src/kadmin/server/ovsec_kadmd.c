@@ -63,14 +63,6 @@
 extern int daemon(int, int);
 #endif
 
-void    setup_signal_handlers(iprop_role iproprole);
-void    request_exit(int);
-
-#ifdef POSIX_SIGNALS
-static struct sigaction s_action;
-#endif /* POSIX_SIGNALS */
-
-
 #define TIMEOUT 15
 
 gss_name_t gss_changepw_name = NULL, gss_oldchangepw_name = NULL;
@@ -234,6 +226,8 @@ int main(int argc, char *argv[])
 
     kdb_log_context *log_ctx;
 
+    verto_ctx *ctx;
+
     setlocale(LC_MESSAGES, "");
     setvbuf(stderr, NULL, _IONBF, 0);
 
@@ -363,6 +357,18 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
+    ctx = loop_init(VERTO_EV_TYPE_SIGNAL);
+    if (!ctx) {
+        krb5_klog_syslog(LOG_ERR,
+                         _("%s: could not initialize loop, aborting"),
+                         whoami);
+        fprintf(stderr, _("%s: could not initialize loop, aborting\n"),
+                        whoami);
+        kadm5_destroy(global_server_handle);
+        krb5_klog_close(context);
+        exit(1);
+    }
+
 #define server_handle ((kadm5_server_handle_t)global_server_handle)
     if ((ret = loop_add_udp_port(server_handle->params.kpasswd_port))
         || (ret = loop_add_tcp_port(server_handle->params.kpasswd_port))
@@ -376,12 +382,13 @@ int main(int argc, char *argv[])
             : 0)
 #endif
 #undef server_handle
-        || (ret = loop_setup_network(global_server_handle, whoami, 0))) {
+        || (ret = loop_setup_network(ctx, global_server_handle, whoami))) {
         const char *e_txt = krb5_get_error_message (context, ret);
         krb5_klog_syslog(LOG_ERR, _("%s: %s while initializing network, "
                                     "aborting"), whoami, e_txt);
         fprintf(stderr, _("%s: %s while initializing network, aborting\n"),
                 whoami, e_txt);
+        loop_free(ctx);
         kadm5_destroy(global_server_handle);
         krb5_klog_close(context);
         exit(1);
@@ -394,6 +401,7 @@ int main(int argc, char *argv[])
                                     "names, failing."));
         fprintf(stderr, _("%s: Cannot build GSS-API authentication names.\n"),
                 whoami);
+        loop_free(ctx);
         kadm5_destroy(global_server_handle);
         krb5_klog_close(context);
         exit(1);
@@ -428,6 +436,7 @@ kterr:
     if (ret) {
         krb5_klog_syslog(LOG_ERR, "%s", krb5_get_error_message (context, ret));
         fprintf(stderr, _("%s: Can't set up keytab for RPC.\n"), whoami);
+        loop_free(ctx);
         kadm5_destroy(global_server_handle);
         krb5_klog_close(context);
         exit(1);
@@ -439,6 +448,7 @@ kterr:
         fprintf(stderr, _("%s: Cannot set GSS-API authentication names.\n"),
                 whoami);
         svcauth_gssapi_unset_names();
+        loop_free(ctx);
         kadm5_destroy(global_server_handle);
         krb5_klog_close(context);
         exit(1);
@@ -461,6 +471,7 @@ kterr:
     if (svcauth_gss_set_svc_name(GSS_C_NO_NAME) != TRUE) {
         fprintf(stderr, _("%s: Cannot initialize RPCSEC_GSS service name.\n"),
                 whoami);
+        loop_free(ctx);
         exit(1);
     }
 
@@ -470,6 +481,7 @@ kterr:
         fprintf(stderr, _("%s: Cannot initialize acl file: %s\n"),
                 whoami, errmsg);
         svcauth_gssapi_unset_names();
+        loop_free(ctx);
         kadm5_destroy(global_server_handle);
         krb5_klog_close(context);
         exit(1);
@@ -481,6 +493,7 @@ kterr:
         krb5_klog_syslog(LOG_ERR, _("Cannot detach from tty: %s"), errmsg);
         fprintf(stderr, _("%s: Cannot detach from tty: %s\n"), whoami, errmsg);
         svcauth_gssapi_unset_names();
+        loop_free(ctx);
         kadm5_destroy(global_server_handle);
         krb5_klog_close(context);
         exit(1);
@@ -492,6 +505,7 @@ kterr:
             krb5_klog_syslog(LOG_ERR, _("Cannot create PID file %s: %s"),
                              pid_file, errmsg);
             svcauth_gssapi_unset_names();
+            loop_free(ctx);
             kadm5_destroy(global_server_handle);
             krb5_klog_close(context);
             exit(1);
@@ -504,6 +518,7 @@ kterr:
         krb5_klog_syslog(LOG_ERR, _("Error getting random seed: %s, aborting"),
                          krb5_get_error_message(context, ret));
         svcauth_gssapi_unset_names();
+        loop_free(ctx);
         kadm5_destroy(global_server_handle);
         krb5_klog_close(context);
         exit(1);
@@ -529,6 +544,7 @@ kterr:
             krb5_klog_syslog(LOG_ERR,
                              _("%s while mapping update log (`%s.ulog')"),
                              error_message(ret), params.dbname);
+            loop_free(ctx);
             krb5_klog_close(context);
             exit(1);
         }
@@ -550,6 +566,7 @@ kterr:
             krb5_klog_syslog(LOG_ERR,
                              _("Cannot create IProp RPC service (PROG=%d, VERS=%d), failing."),
                              KRB5_IPROP_PROG, KRB5_IPROP_VERS);
+            loop_free(ctx);
             krb5_klog_close(context);
             exit(1);
         }
@@ -565,6 +582,7 @@ kterr:
             fprintf(stderr,
                     _("%s: %s while getting IProp svc name, failing\n"),
                     whoami, error_message(ret));
+            loop_free(ctx);
             krb5_klog_close(context);
             exit(1);
         }
@@ -600,24 +618,37 @@ kterr:
                         err.system_error);
             }
 
+            loop_free(ctx);
             exit(1);
         }
         free(kiprop_name);
 #endif
     }
 
-    setup_signal_handlers(log_ctx->iproprole);
+    if (!verto_add_signal(ctx, VERTO_EV_FLAG_PERSIST,
+                          VERTO_SIG_IGN, SIGHUP) ||
+        !verto_add_signal(ctx, VERTO_EV_FLAG_PERSIST,
+                          VERTO_SIG_IGN, SIGPIPE)) {
+        krb5_klog_syslog(LOG_ERR, _("Error setting up main loop"));
+        svcauth_gssapi_unset_names();
+        kadm5_destroy(global_server_handle);
+        krb5_klog_close(context);
+        krb5_free_context(context);
+        loop_free(ctx);
+        exit(1);
+    }
+
     krb5_klog_syslog(LOG_INFO, _("starting"));
     if (nofork)
         fprintf(stderr, _("%s: starting...\n"), whoami);
 
-    loop_listen_and_process(global_server_handle, whoami, NULL);
+    verto_run(ctx);
     krb5_klog_syslog(LOG_INFO, _("finished, exiting"));
 
     /* Clean up memory, etc */
     svcauth_gssapi_unset_names();
     kadm5_destroy(global_server_handle);
-    loop_closedown_network();
+    loop_free(ctx);
     kadm5int_acl_finish(context, 0);
     if(gss_changepw_name) {
         (void) gss_release_name(&OMret, &gss_changepw_name);
@@ -634,71 +665,6 @@ kterr:
     krb5_klog_close(context);
     krb5_free_context(context);
     exit(2);
-}
-
-/*
- * Function: setup_signal_handlers
- *
- * Purpose: Setup signal handling functions using POSIX's sigaction()
- * if possible, otherwise with System V's signal().
- */
-
-void setup_signal_handlers(iprop_role iproprole) {
-#ifdef POSIX_SIGNALS
-    (void) sigemptyset(&s_action.sa_mask);
-    s_action.sa_handler = request_exit;
-    (void) sigaction(SIGINT, &s_action, (struct sigaction *) NULL);
-    (void) sigaction(SIGTERM, &s_action, (struct sigaction *) NULL);
-    (void) sigaction(SIGQUIT, &s_action, (struct sigaction *) NULL);
-    s_action.sa_handler = SIG_IGN;
-    (void) sigaction(SIGHUP, &s_action, (struct sigaction *) NULL);
-    (void) sigaction(SIGPIPE, &s_action, (struct sigaction *) NULL);
-
-    /*
-     * IProp will fork for a full-resync, we don't want to
-     * wait on it and we don't want the living dead procs either.
-     */
-    if (iproprole == IPROP_MASTER) {
-        s_action.sa_handler = SIG_IGN;
-        (void) sigaction(SIGCHLD, &s_action, (struct sigaction *) NULL);
-    }
-#else /* POSIX_SIGNALS */
-    signal(SIGINT, request_exit);
-    signal(SIGTERM, request_exit);
-    signal(SIGQUIT, request_exit);
-    signal(SIGHUP, SIG_IGN);
-    signal(SIGPIPE, SIG_IGN);
-
-    /*
-     * IProp will fork for a full-resync, we don't want to
-     * wait on it and we don't want the living dead procs either.
-     */
-    if (iproprole == IPROP_MASTER)
-        (void) signal(SIGCHLD, SIG_IGN);
-#endif /* POSIX_SIGNALS */
-}
-
-/*
- * Function: request_exit
- *
- * Purpose: sets flags saying the server got a signal and that it
- *          should exit when convient.
- *
- * Arguments:
- * Requires:
- * Effects:
- *      modifies signal_requests_exit which ideally makes the server exit
- *      at some point.
- *
- * Modifies:
- *      signal_requests_exit
- */
-
-void request_exit(int signum)
-{
-    krb5_klog_syslog(LOG_DEBUG, _("Got signal to request exit"));
-    signal_requests_exit = 1;
-    return;
 }
 
 /*
